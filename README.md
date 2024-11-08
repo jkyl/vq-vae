@@ -174,7 +174,7 @@ def diversity_loss_fn(logits: jax.Array) -> jax.Array:
     loss = (codebook_size - perplexity) / codebook_size
     return loss
 ```
-We train the model for 20,000 iterations, or about 8 hours, because GPUs are expensive!
+We train the model on about 45 minutes of 22KHz mono audio for 20,000 steps, because GPUs are expensive!
 
 ![loss plot](loss_plot.png)
 
