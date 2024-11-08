@@ -11,9 +11,9 @@ autoregressively at a highly optimistic 1000 tokens per second.
 
 VQ-VAEs can be used to (lossily) compress the bandwidth (bits per second) of raw audio. They address the problem on two fronts:
 1. They compress along the time dimension -- the sampling rate (in Hz) of the compressed waveform is drastically reduced
-2. They compress along the bit depth dimension -- each compressed sample is represented by fewer bits
+2. They compress along the bit depth dimension -- each sample is represented by fewer bits
 
-A VQ-VAE consists of an encoder, a decoder, and some form of differentiable quantization at its bottleneck. The quantized codes
+A VQ-VAE consists of an encoder, a decoder, and some form of differentiable quantization at the bottleneck. The quantized codes
 can be represented as integers with some number of bits, and can be transmitted much more cheaply than the raw signal, provided 
 that the decoder is already present on the receiver side. 
 
@@ -29,10 +29,9 @@ rely on kludges like reseting codebook entries to random query values at regular
 
 Here we bypass nearest-neighbor lookup entirely, and instead predict the parameters of a categorical distribution over codes. 
 This enables us to control a few properties directly:
-* We can maximize the entropy of the expectation over the minibatch, to ensure codes are used uniformly
+* We can maximize the entropy of the expectation over the minibatch, to ensure codes are used efficiently
 * We can introduce some controlled randomness by sampling, inducing robustness in the decoder
 
-## How does this implementation work?
 Like the standard VQ-VAE, we employ a straight-through estimator to enable backpropagation through the quantization. 
 Sampling is enabled via [the Gumbel-Softmax distribution](https://arxiv.org/abs/1611.01144), which is continuously differentiable
 with respect to its parameters:
@@ -54,13 +53,16 @@ def gumbel_softmax(
     straight_through = probs + jax.lax.stop_gradient(onehot - probs)
     return straight_through
 ```
+
+## Architecture
 In order to encode and decode sequences of arbitrarily different lengths, and to enable a trade-off between time and memory
 during the encoding or decoding of very long sequences, the encoder and decoder are implemented as convolutional networks 
-that are translationally equivariant (TE) up to their stride. This means they satisfy $f(g \cdot x) = g \cdot f(x)$, where 
-$f$ is the network, and $g$ is any translation by an integer multiple of $f$'s stride. This is accomplished by (in effect) 
-using "valid" boundary conditions in the convolutions, meaning no padding is applied. In practice, we use "same" boundary 
-conditions so that the input and output sizes are identical, which enables us to scan successive layers over the network's 
-depth:
+that are translationally equivariant (TE), up to their stride. This means they satisfy $f(g \cdot x) = g \cdot f(x)$, where 
+$f$ is the network, $x$ is any input sequence whose length is divisible by $f$'s stride, and $g$ is any translation by an 
+integer multiple of $f$'s stride. This is accomplished by (in effect) using "valid" boundary conditions in the convolutions, 
+meaning no padding is applied. In practice, we use "same" boundary conditions so that the input and output shapes are identical, 
+which enables us to scan successive layers over the network's depth. The values affected by padding are then cropped off at 
+the end of the layer stack:
 ```python
 class Backbone(nnx.Module):
 
@@ -84,11 +86,11 @@ class Backbone(nnx.Module):
         x = forward(self.blocks, x)
         return x[:, self.p:-self.p]
 ```
-The values affected by padding are cropped off at the end of the layer stack. In addition to "valid" boundary conditions,
-we also need to remove any operations that broadcast any values over the input field, if those values are variable with 
-respect to the inputs. One example of a TE-violating broadcasting operation would be layer normalization -- in general the 
-values of the mean and variance are sensitive to the inputs, and they are broadcast over the entire input field. Instead 
-of any statistical normalization, we use SkipInit to initialize the encoder and decoder close to the identity function:
+In addition to "valid" boundary conditions, we also need to remove any operations that broadcast values over the input 
+field, if those values are variable with respect to the inputs. One example of a TE-violating broadcasting operation would 
+be layer normalization -- the computed mean and variance are sensitive to the layer's inputs, and they are broadcast over 
+the entire input field. Instead we use [SkipInit](https://arxiv.org/abs/2002.10444) to initialize the encoder and decoder
+close to the identity function:
 ```python
 class ResBlock(nnx.Module):
 
@@ -97,7 +99,13 @@ class ResBlock(nnx.Module):
         self.alpha = nnx.Param(jnp.zeros((), dtype=default_dtype))
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        return x + self.alpha * nnx.glu(ckpt(self.conv(x), "conv"))
+        x0 = x
+        x = self.conv(x)
+        x = ckpt(x, "conv")
+        x = nnx.glu(x)
+        x *= self.alpha
+        x += x0
+        return x
 ```
 Also note that the convolution operation is explicitly "checkpointed" -- this is an optimization that tells the compiler
 *not* to rematerialize the operation, even though we are telling it to rematerialize everything else (because the rest of 
