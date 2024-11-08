@@ -4,12 +4,12 @@ A [`jax`](https://jax.readthedocs.io/en/latest)/[`nnx`](https://flax.readthedocs
 Gumbel-Softmax approach from [wav2vec 2.0](https://arxiv.org/abs/2006.11477) instead of nearest-neighbor lookup. 
 
 ## Why vector quantize?
-Digital audio is notoriously difficult to model in its raw form due to its extremely high dimensionality. For example, 
-at the common sampling rate of 44.1 KHz and 16 bits of amplitude resolution, 1 minute of stereo audio amounts to over 5 million 
-samples, or 10 MB! That far exceeds the maximum sequence length of standard Transformers, and would take around an hour to generate 
+Raw audio is notoriously difficult to model due to its extremely high dimensionality. For example, at the common sampling 
+rate of 44.1 KHz and 16 bits of amplitude resolution, 1 minute of stereo audio amounts to over 5 million samples, or 10 MB! 
+That far exceeds the maximum sequence length of standard Transformers, and would take around an hour to generate 
 autoregressively at a highly optimistic 1000 tokens per second. 
 
-VQ-VAEs can be used to (lossily) compress the bandwidth (bits per second) of raw audio. They address the problem on two fronts:
+VQ-VAEs can be used to (lossily) compress the bandwidth (bits per second) of raw audio. They address the problem on both fronts:
 1. They compress along the time dimension -- the sampling rate (in Hz) of the compressed waveform is drastically reduced
 2. They compress along the bit depth dimension -- each sample is represented by fewer bits
 
@@ -58,11 +58,10 @@ def gumbel_softmax(
 In order to encode and decode sequences of arbitrarily different lengths, and to enable a trade-off between time and memory
 during the encoding or decoding of very long sequences, the encoder and decoder are implemented as convolutional networks 
 that are translationally equivariant (TE), up to their stride. This means they satisfy $f(g \cdot x) = g \cdot f(x)$, where 
-$f$ is the network, $x$ is any input sequence whose length is divisible by $f$'s stride, and $g$ is any translation by an 
-integer multiple of $f$'s stride. This is accomplished by (in effect) using "valid" boundary conditions in the convolutions, 
-meaning no padding is applied. In practice, we use "same" boundary conditions so that the input and output shapes are identical, 
-which enables us to scan successive layers over the network's depth. The values affected by padding are then cropped off at 
-the end of the layer stack:
+$f$ is the network, $x$ is any valid input sequence, and $g$ is any translation by an integer multiple of $f$'s stride. This 
+is accomplished by (in effect) using "valid" boundary conditions in the convolutions, meaning no padding is applied. In 
+practice, we use "same" boundary conditions so that the input and output shapes are identical, which enables us to scan 
+successive layers over the network's depth. The values affected by padding are then cropped off at the end of the layer stack:
 ```python
 class Backbone(nnx.Module):
 
@@ -111,8 +110,74 @@ Also note that the convolution operation is explicitly "checkpointed" -- this is
 *not* to rematerialize the operation, even though we are telling it to rematerialize everything else (because the rest of 
 the ops are pointwise and relatively cheap) within the scan. 
 
+---
+
 The encoder and decoder are factored into "octaves": stacks of residual blocks applied at a given timescale. Between octaves,
 we exchange data points between the sequence and channels axes via reshaping. One could think of this as a 1d version of the
 [PixelShuffle operation](https://arxiv.org/abs/1609.05158). This operation is local, and valid under TE, but it does induce
 an overall stride to the network, meaning not all input sequence lengths are valid (e.g. if they are odd when we attempt to 
-reshape by a factor of 2 between any two octaves). 
+reshape by a factor of 2 between any two octaves):
+```python
+class ConvNet(nnx.Module):
+    
+    def __init__(
+        self, 
+        direction: str,
+        *, 
+        octaves: int, 
+        depth: int, 
+        dim: int, 
+        kernel_size: int, 
+        rngs: nnx.Rngs,
+    ):
+        assert direction in ("up", "down")
+        self.direction = direction
+        self.octaves = octaves
+        self.backbones = [Backbone(depth, dim * 2 ** o, kernel_size, rngs=rngs) for o in range(octaves + 1)]
+        if self.direction == "up":
+            self.backbones = self.backbones[::-1]
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        for i, backbone in enumerate(self.backbones):
+            if self.direction == "up" and i > 0:
+                x = x.reshape(-1, x.shape[1] * 2, x.shape[2] // 2)
+            x = backbone(x)
+            if self.direction == "down" and i < self.octaves:
+                x = x.reshape(-1, x.shape[1] // 2, x.shape[2] * 2)
+        return x
+```
+We provide a helper method to compute valid input lengths, given a desired bottleneck length:
+```python
+class VQVAE(nnx.Module):
+    ...
+
+    def valid_length(self, bottleneck: int) -> int:
+        padding_per_octave = (self.kernel_size - 1) * self.depth
+        length = bottleneck + padding_per_octave
+        for _ in range(self.octaves):
+            length *= 2
+            length += padding_per_octave
+        return length
+```
+The ratio between input length and bottleneck length asymptotically approaches the network's stride:
+
+![valid lengths](valid_lengths.png)
+
+## Training
+We use a combination of $L^2$ reconstruction loss and the "diversity loss" from wav2vec 2.0:
+```python
+def diversity_loss_fn(logits: jax.Array) -> jax.Array:
+    codebook_size = logits.shape[-1]
+    avg_probs = nnx.softmax(logits).mean((0, 1))
+    entropy = -jnp.sum(avg_probs * jnp.log(avg_probs + 1e-7))
+    perplexity = jnp.exp(entropy)
+    loss = (codebook_size - perplexity) / codebook_size
+    return loss
+```
+We train the model for 20,000 iterations, or about 8 hours, because GPUs are expensive!
+
+![loss plot](loss_plot.png)
+
+When we encode and decode an audio clip (without Gumbel softmax sampling), we find the audio perfectly legible:
+* [original](original.wav)
+* [round-trip](round-trip.wav)
